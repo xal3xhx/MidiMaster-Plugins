@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .midimaster packages
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          built=0
+          for plugin_dir in plugin-*/; do
+            plugin="${plugin_dir%/}"
+            manifest="$plugin/manifest.json"
+            if [[ ! -f "$manifest" ]]; then
+              echo "::warning::Skipping $plugin — no manifest.json"
+              continue
+            fi
+            id=$(jq -er '.id' "$manifest")
+            version=$(jq -er '.version' "$manifest")
+            output="${id}-${version}.midimaster"
+            # Drop pre-existing .midimaster builds from the checkout so they
+            # don't get re-zipped into the new package
+            find "$plugin" -name '*.midimaster' -type f -delete
+            (cd "$plugin" && zip -rq "../$output" .)
+            echo "Built $output"
+            built=$((built + 1))
+          done
+          if [[ $built -eq 0 ]]; then
+            echo "::error::No plugins built"
+            exit 1
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: '*.midimaster'
+          generate_release_notes: true
+          fail_on_unmatched_files: true
