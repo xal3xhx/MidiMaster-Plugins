@@ -13,7 +13,10 @@ Community plugins for [MidiMaster](https://github.com/prgmitchell/MIDIMaster/) *
 
 ## Installing a Plugin
 
-Download plugin from releases. in midimaster open the plugins page and press the + icon.
+Plugins are distributed as `.midimaster` packages.
+
+- Install from file: `Plugins -> Installed -> Install Plugin...`
+- Install from the in-app Store: `Plugins -> Store`
 
 ## Status
 
