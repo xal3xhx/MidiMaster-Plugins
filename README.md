@@ -2,7 +2,7 @@
 
 > **Work in progress — not currently stable.**
 
-Community plugins for [MidiMaster](https://github.com/alexh/midimaster) *(MIDI controller mapping app)*.
+Community plugins for [MidiMaster](https://github.com/prgmitchell/MIDIMaster/) *(MIDI controller mapping app)*.
 
 ## Plugins
 
@@ -13,7 +13,7 @@ Community plugins for [MidiMaster](https://github.com/alexh/midimaster) *(MIDI c
 
 ## Installing a Plugin
 
-Drop the plugin folder into MidiMaster's plugins directory and restart the app.
+Download plugin from releases. in midimaster open the plugins page and press the + icon.
 
 ## Status
 
