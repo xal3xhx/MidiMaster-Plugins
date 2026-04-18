@@ -2,6 +2,10 @@
 //
 // Plays audio files mapped to MIDI buttons. Supports multiple sounds per pad
 // with next/prev cycling. Audio data stored in IndexedDB, metadata in profile.
+//
+// OSD is owned entirely by the plugin via ctx.osd.* (requires MIDIMaster
+// with the plugin OSD control API). Integration targets skip the default
+// OSD emit, so the plugin renders its own text cards here.
 
 function clamp01(v) {
   const n = Number(v);
@@ -100,20 +104,39 @@ function ensureAudioContext() {
   try {
     audioContext = new AudioContext(opts);
   } catch {
-    // Fallback without sinkId if unsupported
-    audioContext = new AudioContext();
+    try {
+      audioContext = new AudioContext();
+    } catch {
+      audioContext = null;
+    }
   }
   return audioContext;
 }
 
+// Chromium requires a user gesture to resume a suspended AudioContext.
+// Tab mount and preview clicks satisfy that — call this from those paths
+// so MIDI-triggered plays (not gestures) can run afterwards.
+async function primeAudioFromGesture() {
+  try {
+    const ctx = ensureAudioContext();
+    if (!ctx) return;
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+  } catch {}
+}
+
 async function playSound(soundId) {
   const ctx = ensureAudioContext();
+  if (!ctx) return;
+  if (ctx.state === "suspended") {
+    try { await ctx.resume(); } catch { return; }
+  }
 
   let buffer = decodedBufferCache.get(soundId);
   if (!buffer) {
     const record = await loadAudio(soundId);
     if (!record || !record.data) return;
-    // Clone the ArrayBuffer since decodeAudioData detaches it
     const copy = record.data.slice(0);
     buffer = await ctx.decodeAudioData(copy);
     decodedBufferCache.set(soundId, buffer);
@@ -129,7 +152,6 @@ function updateOutputDevice(deviceId) {
   currentOutputDeviceId = deviceId || "";
   decodedBufferCache.clear();
   if (audioContext && audioContext.state !== "closed") {
-    // Try setSinkId if available, otherwise recreate
     if (typeof audioContext.setSinkId === "function" && currentOutputDeviceId) {
       audioContext.setSinkId(currentOutputDeviceId).catch(() => {
         try { audioContext.close(); } catch {}
@@ -205,15 +227,13 @@ export async function activate(ctx) {
     iconDataUrl = null;
   }
 
-  // -------------------------------------------------------------------------
-  // Settings state (needed by both main window and OSD for describeTarget)
-  // -------------------------------------------------------------------------
+  // Cache-bust describeTarget label since data.label is part of the OSD key.
+  // We want one reused card per pad+action, so we put the dynamic bits into
+  // a field the key-builder strips.
   let settings = getSettings(ctx);
 
-  // Shared describeTarget — reads live settings so the OSD always shows
-  // the current sound name, not a stale cached label.
   function describeTargetImpl(target) {
-    // Re-read settings each call so cycling updates are visible immediately
+    // Re-read settings each call so cycling updates are visible immediately.
     settings = getSettings(ctx);
 
     const t = target?.Integration || target?.integration;
@@ -236,7 +256,7 @@ export async function activate(ctx) {
   }
 
   // -------------------------------------------------------------------------
-  // OSD-only window: register describeTarget for label resolution, skip rest
+  // OSD window: only needs describeTarget so ctx.osd cards can render labels.
   // -------------------------------------------------------------------------
   if (isOsdWindow()) {
     ctx.registerIntegration({
@@ -247,9 +267,14 @@ export async function activate(ctx) {
     });
     return;
   }
+
   currentOutputDeviceId = settings.output_device_id || "";
 
-  // Track bindings for cross-binding feedback updates
+  // Feature detection: new OSD API added in MIDIMaster with plugin OSD control.
+  const hasOsdApi = !!(ctx.osd && typeof ctx.osd.showVolume === "function");
+
+  // Cross-binding refresh: after cycling, peer play-bindings need their
+  // controller feedback + card label redrawn.
   let currentBindings = [];
   try { currentBindings = ctx.bindings?.getAll?.() || []; } catch {}
   ctx.bindings?.onChanged?.((next) => {
@@ -266,13 +291,50 @@ export async function activate(ctx) {
     });
   }
 
-  // React to profile changes
   ctx.profile?.onChanged?.(() => {
     settings = getSettings(ctx);
     currentOutputDeviceId = settings.output_device_id || "";
     clearBufferCache();
     renderTabIfMounted();
   });
+
+  // -------------------------------------------------------------------------
+  // OSD helpers
+  // -------------------------------------------------------------------------
+  function padTarget(padId, sbAction) {
+    return {
+      Integration: {
+        integration_id: "soundboard",
+        kind: "pad",
+        data: { pad_id: padId, sb_action: sbAction },
+      },
+    };
+  }
+
+  async function flashOsd(padId, sbAction, pad, opts = {}) {
+    if (!hasOsdApi) return;
+    const target = padTarget(padId, sbAction);
+    const count = (pad?.sounds || []).length;
+    const hasMany = count > 1;
+    const idx = Math.max(0, Math.min(pad?.current_index || 0, Math.max(0, count - 1)));
+    const value = hasMany ? (idx + 1) / count : 1.0;
+
+    // OSD window does not load plugins, so describeTarget never runs there.
+    // Inject resolved label/icon into data.* (key-builder strips these), so
+    // the OSD-side fallback in resolveOsdTarget uses them for display.
+    const desc = describeTargetImpl(target);
+    target.Integration.data.label = desc.label;
+    if (desc.icon_data) target.Integration.data.icon_data = desc.icon_data;
+
+    // Hide bar + value for all soundboard actions — label alone carries
+    // the state (pad name + current sound name + cycle arrow).
+    const showBar = opts.showBar ?? false;
+    const showValue = opts.showValue ?? false;
+
+    try {
+      await ctx.osd.showVolume(target, value, { showBar, showValue });
+    } catch {}
+  }
 
   // -------------------------------------------------------------------------
   // Integration Registration
@@ -287,11 +349,9 @@ export async function activate(ctx) {
     getTargetOptions: async (ctx2) => {
       const nav = ctx2 && typeof ctx2 === "object" ? ctx2.nav : null;
 
-      // Pad-level: show play/next/prev action targets
       if (nav && nav.screen === "pad" && nav.pad_id) {
         const padId = String(nav.pad_id);
         const pad = findPad(settings, padId);
-        const padName = pad ? pad.name : "Pad";
         const soundCount = pad ? (pad.sounds || []).length : 0;
 
         const opts = [];
@@ -299,13 +359,7 @@ export async function activate(ctx) {
         opts.push({
           label: "Play Sound",
           icon_data: iconDataUrl,
-          target: {
-            Integration: {
-              integration_id: "soundboard",
-              kind: "pad",
-              data: { pad_id: padId, sb_action: "play" },
-            },
-          },
+          target: padTarget(padId, "play"),
           buttonActions: [{ label: "Play Sound", value: "Volume" }],
         });
 
@@ -313,26 +367,14 @@ export async function activate(ctx) {
           opts.push({
             label: "Next Sound",
             icon_data: iconDataUrl,
-            target: {
-              Integration: {
-                integration_id: "soundboard",
-                kind: "pad",
-                data: { pad_id: padId, sb_action: "next" },
-              },
-            },
+            target: padTarget(padId, "next"),
             buttonActions: [{ label: "Next Sound", value: "Volume" }],
           });
 
           opts.push({
             label: "Previous Sound",
             icon_data: iconDataUrl,
-            target: {
-              Integration: {
-                integration_id: "soundboard",
-                kind: "pad",
-                data: { pad_id: padId, sb_action: "prev" },
-              },
-            },
+            target: padTarget(padId, "prev"),
             buttonActions: [{ label: "Previous Sound", value: "Volume" }],
           });
         }
@@ -344,7 +386,6 @@ export async function activate(ctx) {
         return opts;
       }
 
-      // Root level: list pads as navigation entries
       if (settings.pads.length === 0) {
         return [{ label: "Create pads in the Soundboard settings tab.", kind: "placeholder", ghost: true }];
       }
@@ -375,26 +416,33 @@ export async function activate(ctx) {
         const sound = getPadCurrentSound(pad);
         if (!sound) return;
         playSound(sound.id).catch((e) => console.error("[soundboard] playSound error:", e));
+
+        await flashOsd(padId, "play", pad);
+
         const feedbackVal = soundCount > 1 ? (pad.current_index + 1) / soundCount : 1.0;
-        if (bindingId) await ctx.feedback.set(bindingId, feedbackVal, "Volume");
+        if (bindingId) {
+          await ctx.feedback.set(bindingId, feedbackVal, "Volume", { silent: true });
+        }
         return;
       }
 
       if (sbAction === "next" || sbAction === "prev") {
         const currentIdx = Math.max(0, Math.min(pad.current_index || 0, soundCount - 1));
-        let newIdx;
-        if (sbAction === "next") {
-          newIdx = (currentIdx + 1) % soundCount;
-        } else {
-          newIdx = (currentIdx - 1 + soundCount) % soundCount;
-        }
+        const newIdx = sbAction === "next"
+          ? (currentIdx + 1) % soundCount
+          : (currentIdx - 1 + soundCount) % soundCount;
         pad.current_index = newIdx;
         await saveSettings(ctx, settings);
 
-        const feedbackVal = soundCount > 1 ? (newIdx + 1) / soundCount : 1.0;
-        if (bindingId) await ctx.feedback.set(bindingId, feedbackVal, "Volume");
+        await flashOsd(padId, sbAction, pad);
 
-        // Silently update play bindings for same pad so their OSD label refreshes
+        const feedbackVal = soundCount > 1 ? (newIdx + 1) / soundCount : 1.0;
+        if (bindingId) {
+          await ctx.feedback.set(bindingId, feedbackVal, "Volume", { silent: true });
+        }
+
+        // Peer play-bindings: update their controller LED/slider and refresh
+        // their OSD label (since current sound changed).
         const playBindings = findBindingsForPad(padId, "play");
         for (const pb of playBindings) {
           try {
@@ -419,7 +467,6 @@ export async function activate(ctx) {
   }
 
   function renderTab(container) {
-    // Refresh settings from profile
     settings = getSettings(ctx);
 
     container.innerHTML = `
@@ -443,9 +490,9 @@ export async function activate(ctx) {
         .sb-sound-btn:hover { color: var(--text, #e0e0e0); background: var(--hover-bg, rgba(255,255,255,0.05)); }
         .sb-add-sound { font-size: 12px; padding: 4px 10px; }
         .sb-add-pad { margin-top: 4px; }
-        .sb-output-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+        .sb-output-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
         .sb-output-row label { font-size: 13px; color: var(--text-muted, #888); white-space: nowrap; }
-        .sb-output-row select { flex: 1; background: var(--input-bg, #1a1a2e); border: 1px solid var(--border, #333);
+        .sb-output-row select { max-width: 260px; background: var(--input-bg, #1a1a2e); border: 1px solid var(--border, #333);
           color: var(--text, #e0e0e0); padding: 4px 8px; border-radius: 4px; font-size: 13px; }
         .sb-empty { color: var(--text-muted, #888); font-size: 12px; font-style: italic; padding: 4px 8px; }
       </style>
@@ -460,13 +507,13 @@ export async function activate(ctx) {
         </div>
       </div>
       <div class="connection-content-wrapper">
-        <div class="connection-grid">
+        <div class="connection-grid" style="width: 100%;">
           <div class="sb-output-row">
             <label>Output Device</label>
             <select data-role="output-device"><option value="">System Default</option></select>
           </div>
+          <div class="sb-pads-list" data-role="pads-list"></div>
         </div>
-        <div class="sb-pads-list" data-role="pads-list"></div>
       </div>
       <div class="connection-footer">
         <button type="button" class="connection-button sb-add-pad" data-role="add-pad">+ Add Pad</button>
@@ -477,13 +524,13 @@ export async function activate(ctx) {
     const padsList = container.querySelector('[data-role="pads-list"]');
     const addPadBtn = container.querySelector('[data-role="add-pad"]');
 
-    // Populate output devices
-    populateOutputDevices(outputSelect);
+    // Tab mount is a user gesture — prime AudioContext so MIDI-triggered
+    // plays (not gestures from WebView2's POV) can run afterwards.
+    primeAudioFromGesture();
 
-    // Render pads
+    populateOutputDevices(outputSelect);
     renderPads(padsList);
 
-    // Add pad button
     addPadBtn.addEventListener("click", async () => {
       const padId = "pad-" + generateId();
       const padName = "Pad " + settings.next_pad_num;
@@ -494,20 +541,52 @@ export async function activate(ctx) {
     });
   }
 
-  async function populateOutputDevices(selectEl) {
+  async function enumerateOutputs() {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
-      const outputs = devices.filter((d) => d.kind === "audiooutput");
-      for (const dev of outputs) {
-        if (!dev.deviceId) continue;
-        const opt = document.createElement("option");
-        opt.value = dev.deviceId;
-        opt.textContent = dev.label || `Output (${dev.deviceId.slice(0, 8)})`;
-        selectEl.appendChild(opt);
-      }
-    } catch {}
+      return devices.filter((d) => d.kind === "audiooutput" && d.deviceId);
+    } catch {
+      return [];
+    }
+  }
 
+  // Chromium hides deviceId + label on enumerateDevices() until the page
+  // has held a media permission. Request a short-lived mic stream, drop
+  // it immediately, then re-enumerate to get real IDs and labels.
+  async function unlockDeviceInfo() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      for (const t of stream.getTracks()) t.stop();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function fillSelect(selectEl, outputs) {
+    const existing = selectEl.querySelectorAll("option:not([value=''])");
+    existing.forEach((o) => o.remove());
+    for (const dev of outputs) {
+      const opt = document.createElement("option");
+      opt.value = dev.deviceId;
+      opt.textContent = dev.label || `Output (${dev.deviceId.slice(0, 8)})`;
+      selectEl.appendChild(opt);
+    }
     selectEl.value = settings.output_device_id || "";
+  }
+
+  async function populateOutputDevices(selectEl) {
+    let outputs = await enumerateOutputs();
+
+    // If labels are hidden, grant media permission once so device info
+    // becomes visible, then re-enumerate.
+    if (outputs.length === 0 || outputs.every((d) => !d.label)) {
+      await unlockDeviceInfo();
+      outputs = await enumerateOutputs();
+    }
+
+    fillSelect(selectEl, outputs);
+
     selectEl.addEventListener("change", async () => {
       settings.output_device_id = selectEl.value;
       updateOutputDevice(selectEl.value);
@@ -540,15 +619,12 @@ export async function activate(ctx) {
       const soundListEl = padEl.querySelector('[data-role="sound-list"]');
       const addSoundBtn = padEl.querySelector('[data-role="add-sound"]');
 
-      // Pad name editing
       nameInput.addEventListener("change", async () => {
         pad.name = nameInput.value.trim() || pad.name;
         await saveSettings(ctx, settings);
       });
 
-      // Delete pad
       deletePadBtn.addEventListener("click", async () => {
-        // Delete all sounds from IndexedDB
         for (const snd of pad.sounds) {
           deleteAudio(snd.id).catch(() => {});
           clearBufferCache(snd.id);
@@ -561,10 +637,8 @@ export async function activate(ctx) {
         }
       });
 
-      // Render sounds
       renderSounds(soundListEl, pad);
 
-      // Add sound
       addSoundBtn.addEventListener("click", () => {
         const input = document.createElement("input");
         input.type = "file";
@@ -577,7 +651,6 @@ export async function activate(ctx) {
           document.body.removeChild(input);
           if (!file) return;
 
-          // Validate size (10MB max)
           if (file.size > 10 * 1024 * 1024) {
             console.error("[soundboard] File too large:", file.name, file.size);
             return;
@@ -586,7 +659,7 @@ export async function activate(ctx) {
           try {
             const arrayBuffer = await file.arrayBuffer();
             const soundId = "snd-" + generateId();
-            const name = file.name.replace(/\.[^/.]+$/, ""); // Strip extension
+            const name = file.name.replace(/\.[^/.]+$/, "");
 
             await storeAudio(soundId, arrayBuffer, file.type, file.name);
             pad.sounds.push({ id: soundId, name });
@@ -634,7 +707,6 @@ export async function activate(ctx) {
         deleteAudio(sound.id).catch(() => {});
         clearBufferCache(sound.id);
         pad.sounds = pad.sounds.filter((s) => s.id !== sound.id);
-        // Adjust current_index
         if (pad.sounds.length === 0) {
           pad.current_index = 0;
         } else if (pad.current_index >= pad.sounds.length) {
